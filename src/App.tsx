@@ -1,30 +1,24 @@
 import { useState, useEffect, useRef } from 'react';
-import { Bike, Wifi, WifiOff } from 'lucide-react';
+import { Bike, Wifi, WifiOff, AlertOctagon, Zap, History } from 'lucide-react';
 import HelmetVisualization from './components/HelmetVisualization';
 import LocationCard from './components/LocationCard';
 import SensorDataCard from './components/SensorDataCard';
+// import SettingsPanel from './components/SettingsPanel'; // Supprimé
 import AccidentAlert from './components/AccidentAlert';
+import PathVisualization from './components/PathVisualization'; // <-- NOUVEL IMPORT
 import { getSimulatedData, type SensorData } from './data/staticData';
-import { getLatestSensorData, subscribeSensorData, type SensorDataRow, supabase } from './lib/supabase';
+import { getLatestSensorData, subscribeSensorData, type SensorDataRow, supabase, getSensorHistory } from './lib/supabase';
 import { AccidentDetectionService } from './lib/accidentDetection';
 
 // Helper: Calcule les angles d'inclinaison (Pitch/Roll) à partir de la gravité (Accéléromètre)
-// RETOURNE DES DEGRÉS (Essentiel pour que la visualisation 3D fonctionne)
 function calculateOrientation(acc: { x: number; y: number; z: number }) {
   const pitchRad = Math.atan2(acc.y, acc.z);
-  // Note: On inverse X pour le Roll pour correspondre aux mouvements standards
   const rollRad = Math.atan2(-acc.x, Math.sqrt(acc.y * acc.y + acc.z * acc.z));
-  
   const toDeg = (rad: number) => rad * (180 / Math.PI);
-  
-  return { 
-    x: toDeg(pitchRad), 
-    y: 0, // Le lacet (Yaw/Z) n'est pas calculable avec l'accéléromètre seul
-    z: toDeg(rollRad) 
-  };
+  return { x: toDeg(pitchRad), y: 0, z: toDeg(rollRad) };
 }
 
-// Helper: Filtre Passe-Bas pour lisser les données (réduit le tremblement)
+// Helper: Filtre Passe-Bas pour lisser les données
 function lowPassFilter(current: number, previous: number, alpha: number = 0.1) {
   return previous + alpha * (current - previous);
 }
@@ -44,13 +38,14 @@ function App() {
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null);
   const [activeAccident, setActiveAccident] = useState<{ id: string; dangerPercentage: number } | null>(null);
 
+  // --- ÉTATS POUR L'HISTORIQUE ---
+  const [showHistory, setShowHistory] = useState(false);
+  const [historyData, setHistoryData] = useState<any[]>([]);
+  const [loadingHistory, setLoadingHistory] = useState(false);
+
   const detectionService = useRef(new AccidentDetectionService());
   const accidentTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  
-  // Référence pour le lissage des données
   const prevAccel = useRef({ x: 0, y: 0, z: 1 });
-
-  // --- VERROU : Empêche l'envoi de multiples messages pour le même accident ---
   const isTriggered = useRef(false); 
 
   useEffect(() => {
@@ -59,7 +54,6 @@ function App() {
     const handleNewData = (newData: SensorDataRow) => {
       const raw = convertToSensorData(newData);
       
-      // Logique de lissage
       const smoothAlpha = 0.1; 
       const smoothedAccel = {
         x: lowPassFilter(raw.accelerometer.x, prevAccel.current.x, smoothAlpha),
@@ -74,7 +68,7 @@ function App() {
       setIsConnected(true);
       setLastUpdate(new Date(newData.created_at));
 
-      // Logique de détection
+      // Alimentation du service de détection
       detectionService.current.addReading(
         finalData.accelerometer.x, finalData.accelerometer.y, finalData.accelerometer.z,
         finalData.gyroscope.x, finalData.gyroscope.y, finalData.gyroscope.z
@@ -82,16 +76,18 @@ function App() {
 
       const result = detectionService.current.detectWithHistory();
       const zValue = finalData.accelerometer.z;
-      const isUpsideDown = zValue < 0.0; 
 
-      // --- VÉRIFICATION DU VERROU ---
-      if ((result.isAccident || isUpsideDown) && !activeAccident && !isTriggered.current) {
-        console.log('ACCIDENT DÉCLENCHÉ');
-        
-        // 1. VERROUILLAGE IMMÉDIAT
+      // --- LOGIQUE D'ACCIDENT SCOOTER ---
+      const isUpsideDown = zValue < -0.5;
+      const isTippedOver = Math.abs(zValue) < 0.4; 
+
+      if ((result.isAccident || isUpsideDown || isTippedOver) && !activeAccident && !isTriggered.current) {
+        console.log('ACCIDENT DÉTECTÉ (Impact, Retournement ou Chute)');
         isTriggered.current = true;
-
-        const finalDanger = isUpsideDown ? 100 : result.dangerPercentage;
+        
+        let finalDanger = result.dangerPercentage;
+        if (isUpsideDown) finalDanger = 100; 
+        else if (isTippedOver) finalDanger = Math.max(finalDanger, 80); 
 
         handleAccidentDetected(
           finalData.location.latitude, finalData.location.longitude, finalDanger,
@@ -110,7 +106,9 @@ function App() {
     initializeData();
 
     const checkTimeout = setInterval(() => {
-      if (lastUpdate && Date.now() - lastUpdate.getTime() > 5000) setIsConnected(false);
+      if (lastUpdate && Date.now() - lastUpdate.getTime() > 5000) {
+        setIsConnected(false);
+      }
     }, 1000);
 
     return () => {
@@ -118,6 +116,18 @@ function App() {
       clearInterval(checkTimeout);
     };
   }, [lastUpdate, activeAccident]);
+
+  // --- FONCTION: Charger/Afficher l'historique ---
+  const toggleHistory = async () => {
+    if (!showHistory) {
+      setLoadingHistory(true);
+      // Récupère les 7 derniers jours
+      const data = await getSensorHistory(7); 
+      setHistoryData(data || []);
+      setLoadingHistory(false);
+    }
+    setShowHistory(!showHistory);
+  };
 
   const handleAccidentDetected = async (
     latitude: number, longitude: number, dangerPercentage: number,
@@ -141,7 +151,7 @@ function App() {
 
       const { data: settings } = await supabase.from('user_settings').select('*').limit(1).maybeSingle();
 
-      // Envoi Telegram même si aucun email n'est configuré (car IDs dans secrets)
+      // Envoi Telegram (même sans email)
       if (settings) {
         await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/send-accident-alert`, {
           method: 'POST',
@@ -164,7 +174,7 @@ function App() {
         await sendEmergencyAlerts(accidentLog.id, settings, latitude, longitude, dangerPercentage);
       }, 30000);
     } catch (error) {
-      console.error('Erreur lors de la gestion de l\'accident:', error);
+      console.error('Erreur gestion accident:', error);
     }
   };
 
@@ -188,8 +198,6 @@ function App() {
       await supabase.from('accident_logs').update({ status: 'confirmed', emails_sent: true }).eq('id', accidentId);
     }
     setActiveAccident(null);
-    
-    // Déverrouillage après l'envoi des alertes
     setTimeout(() => { isTriggered.current = false; }, 5000);
   };
 
@@ -200,15 +208,20 @@ function App() {
       await supabase.from('accident_logs').update({ status: 'cancelled', user_responded: true }).eq('id', activeAccident.id);
       setActiveAccident(null);
       detectionService.current.reset();
-
-      console.log("Alerte annulée.");
-      // Délai avant de réarmer le système
       setTimeout(() => { isTriggered.current = false; }, 5000);
     }
   };
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-gray-50 to-gray-200 relative">
+      {/* MODALE HISTORIQUE */}
+      {showHistory && (
+        <PathVisualization 
+          data={historyData} 
+          onClose={() => setShowHistory(false)} 
+        />
+      )}
+
       {activeAccident && (
         <AccidentAlert
           accidentId={activeAccident.id}
@@ -216,34 +229,56 @@ function App() {
           onCancel={handleCancelAccident}
         />
       )}
+
       <header className="bg-white shadow-sm border-b border-gray-200">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
-              <div className="p-2 bg-blue-600 rounded-lg">
-                <Bike className="w-8 h-8 text-white" />
+              <div className="p-2 bg-indigo-600 rounded-lg">
+                <Zap className="w-8 h-8 text-white" />
               </div>
               <div>
-                <h1 className="text-2xl font-bold text-gray-900">Motorcycle Helmet IoT Dashboard</h1>
-                <p className="text-sm text-gray-600">Real-time monitoring system</p>
+                <h1 className="text-2xl font-bold text-gray-900">Scooter Guardian</h1>
+                <p className="text-sm text-gray-600">Système de Sécurité & Tracking</p>
               </div>
             </div>
             <div className="flex items-center gap-2">
+              {/* BOUTON HISTORIQUE */}
+              <button 
+                onClick={toggleHistory}
+                disabled={loadingHistory}
+                className="p-2 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg transition flex items-center gap-2"
+                title="Voir l'historique (7 jours)"
+              >
+                <History className={`w-5 h-5 ${loadingHistory ? 'animate-spin' : ''}`} />
+                <span className="hidden sm:inline">{loadingHistory ? 'Chargement...' : 'Historique'}</span>
+              </button>
+
               {isConnected ? (
                 <>
                   <Wifi className="w-5 h-5 text-green-600" />
-                  <span className="text-sm font-medium text-green-600">Live</span>
+                  <span className="text-sm font-medium text-green-600 hidden sm:inline">Connecté</span>
                 </>
               ) : (
                 <>
                   <WifiOff className="w-5 h-5 text-red-600" />
-                  <span className="text-sm font-medium text-red-600">Disconnected</span>
+                  <span className="text-sm font-medium text-red-600 hidden sm:inline">Hors ligne</span>
                 </>
               )}
             </div>
           </div>
         </div>
       </header>
+
+      {/* BANNIÈRE D'AVERTISSEMENT HORS LIGNE */}
+      {!isConnected && (
+        <div className="bg-red-500 text-white text-center py-2 font-bold animate-pulse shadow-md">
+          <div className="flex items-center justify-center gap-2">
+            <AlertOctagon className="w-5 h-5" />
+            <span>CONNEXION PERDUE : Le scooter ne transmet plus de données ! Vérifiez l'alimentation.</span>
+          </div>
+        </div>
+      )}
 
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 h-[calc(100vh-140px)]">
@@ -254,11 +289,11 @@ function App() {
             timestamp={sensorData.timestamp}
           />
           <div className="bg-white rounded-lg shadow-lg p-4 flex flex-col">
-            <h2 className="text-xl font-semibold text-gray-800 mb-3">3D Helmet Orientation</h2>
+            <h2 className="text-xl font-semibold text-gray-800 mb-3">Orientation Scooter (Direct)</h2>
             <div className="flex-1 w-full">
               <HelmetVisualization rotation={calculateOrientation(sensorData.accelerometer)} />
             </div>
-            <div className="mt-3 text-xs text-gray-600 text-center">Use mouse to rotate • Scroll to zoom</div>
+            <div className="mt-3 text-xs text-gray-600 text-center">Visualisation temps réel</div>
           </div>
         </div>
       </main>

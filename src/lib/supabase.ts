@@ -34,6 +34,23 @@ export async function getLatestSensorData(): Promise<SensorDataRow | null> {
 
   return data;
 }
+export async function getSensorHistory(days: number = 7) {
+  const date = new Date();
+  date.setDate(date.getDate() - days);
+
+  const { data, error } = await supabase
+    .from('sensor_data')
+    .select('latitude, longitude, created_at')
+    .gte('created_at', date.toISOString())
+    .order('created_at', { ascending: true })
+    .limit(2000); // Limit to 2000 points to prevent crashing the browser
+
+  if (error) {
+    console.error('Error fetching history:', error);
+    return [];
+  }
+  return data;
+}
 
 export function subscribeSensorData(callback: (data: SensorDataRow) => void) {
   const channel = supabase
